@@ -1,6 +1,4 @@
-﻿# FullUnlock.ps1 - 极域键盘锁双层解锁（内核驱动清理 + 用户态循环挂钩）
-# 以管理员身份运行
-# 保存为 UTF-8 with BOM 编码
+﻿
 
 # ================= 权限检查 =================
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
