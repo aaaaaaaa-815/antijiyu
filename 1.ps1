@@ -1,87 +1,23 @@
-﻿
+# LockHotkeys.ps1
+# Ctrl+Shift+C  -> 锁屏 (独占，吞掉按键)
+# Scroll Lock   -> 锁屏 (非独占，继续传递)
+# 低级键盘钩子，高进程优先级
 
-# ================= 权限检查 =================
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    Write-Host "[!] 请以管理员身份运行此脚本！" -ForegroundColor Red
-    Read-Host "按 Enter 退出"
-    exit 1
-}
-
-$ErrorActionPreference = "SilentlyContinue"
-
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  极域键盘锁双层解锁工具" -ForegroundColor Cyan
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host ""
-
-# ================= 第一部分：内核驱动清理 =================
-Write-Host "【第一部分】清除 TDKeybd.sys 内核驱动" -ForegroundColor Yellow
-Write-Host ""
-
-# 1. 获取键盘类驱动注册表项所有权
-$regKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E96B-E325-11CE-BFC1-08002BE10318}"
-$regPath = "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Class\{4D36E96B-E325-11CE-BFC1-08002BE10318}"
-
-Write-Host "[*] 获取注册表项所有权..." -ForegroundColor Gray
-takeown /f $regPath /r 2>&1 | Out-Null
-icacls $regPath /grant administrators:F 2>&1 | Out-Null
-
-# 2. 从 UpperFilters 中移除 TDKeybd
-$filters = (Get-ItemProperty -Path $regKey -Name "UpperFilters" -ErrorAction SilentlyContinue).UpperFilters
-if ($filters -match "TDkeybd") {
-    $newFilters = $filters | Where-Object { $_ -notmatch "TDkeybd" }
-    Set-ItemProperty -Path $regKey -Name "UpperFilters" -Value $newFilters -Type MultiString
-    Write-Host "[+] 已从 UpperFilters 移除 TDkeybd" -ForegroundColor Green
-} else {
-    Write-Host "[!] UpperFilters 中未找到 TDkeybd" -ForegroundColor Gray
-}
-
-# 3. 删除服务注册表项
-Write-Host "[*] 删除服务注册表项..." -ForegroundColor Gray
-$svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\TDKeybd"
-if (Test-Path $svcKey) {
-    takeown /f "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\TDKeybd" /r 2>&1 | Out-Null
-    icacls "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\TDKeybd" /grant administrators:F 2>&1 | Out-Null
-    Remove-Item -Path $svcKey -Recurse -Force
-    Write-Host "[+] 服务注册表项已删除" -ForegroundColor Green
-} else {
-    Write-Host "[!] 服务注册表项不存在" -ForegroundColor Gray
-}
-
-# 4. 删除驱动文件
-Write-Host "[*] 删除驱动文件..." -ForegroundColor Gray
-$driverPaths = @(
-    "C:\Windows\System32\drivers\TDKeybd.sys",
-    "C:\Windows\SysWOW64\drivers\TDKeybd.sys"
-)
-foreach ($path in $driverPaths) {
-    if (Test-Path $path) {
-        takeown /f $path 2>&1 | Out-Null
-        icacls $path /grant administrators:F 2>&1 | Out-Null
-        if (Remove-Item -Path $path -Force -ErrorAction SilentlyContinue) {
-            Write-Host "[+] 已删除: $path" -ForegroundColor Green
-        } else {
-            Write-Host "[!] 文件被占用，未能删除（内存中驱动仍在运行）: $path" -ForegroundColor DarkYellow
-        }
-    }
-}
-Write-Host "[*] 内核驱动清理阶段完成。若驱动已加载，需重启才能彻底生效。" -ForegroundColor Yellow
-Write-Host ""
-
-# ================= 第二部分：用户态循环挂钩 =================
-Write-Host "【第二部分】启动用户态循环挂钩" -ForegroundColor Yellow
-Write-Host ""
-
-$code = @"
+Add-Type -TypeDefinition @"
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Threading;
+using System.Windows.Forms;
 
-public class HookLooper
+public class MultiLockHotkey
 {
-    private const int WH_KEYBOARD_LL = 13;
-    private const int PM_REMOVE = 0x0001;
+    private const int WH_KEYBOARD_LL   = 13;
+    private const int WM_KEYDOWN       = 0x0100;
+    private const int WM_SYSKEYDOWN    = 0x0104;
+    private const int VK_CONTROL       = 0x11;
+    private const int VK_SHIFT         = 0x10;
+    private const int VK_C             = 0x43;
+    private const int VK_SCROLL        = 0x91;
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -92,91 +28,103 @@ public class HookLooper
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
-    [DllImport("user32.dll")]
-    private static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+    [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
 
     [DllImport("user32.dll")]
-    private static extern bool TranslateMessage(ref MSG lpMsg);
+    private static extern short GetAsyncKeyState(int vKey);
 
     [DllImport("user32.dll")]
-    private static extern IntPtr DispatchMessage(ref MSG lpMsg);
+    private static extern bool LockWorkStation();
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MSG
-    {
-        public IntPtr hwnd;
-        public uint message;
-        public IntPtr wParam;
-        public IntPtr lParam;
-        public uint time;
-        public int pt_x;
-        public int pt_y;
-    }
+    [DllImport("kernel32.dll")]
+    private static extern bool SetPriorityClass(IntPtr hProcess, uint dwPriorityClass);
 
-    public static volatile int HookCount = 0;
-    public static volatile bool Running = true;
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
 
-    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-    {
-        // 返回 0：消息不再传递给后续钩子（包括极域的钩子），按键恢复正常
-        return IntPtr.Zero;
-    }
+    private const uint HIGH_PRIORITY_CLASS = 0x00000080;
+
+    private static IntPtr _hookID = IntPtr.Zero;
+    private static LowLevelKeyboardProc _proc = HookCallback;
+    private static DateTime _lastFireCtrlC = DateTime.MinValue;
+    private static DateTime _lastFireScroll = DateTime.MinValue;
+    private static readonly TimeSpan Debounce = TimeSpan.FromMilliseconds(800);
 
     public static void Start()
     {
-        Thread thread = new Thread(() =>
-        {
-            LowLevelKeyboardProc proc = HookCallback;
-            while (Running)
-            {
-                IntPtr hook = SetWindowsHookEx(WH_KEYBOARD_LL, proc, IntPtr.Zero, 0);
-                if (hook != IntPtr.Zero)
-                {
-                    HookCount++;
-                    uint startTime = (uint)Environment.TickCount;
-                    MSG msg;
-                    while ((uint)Environment.TickCount - startTime < 50 && Running)
-                    {
-                        while (PeekMessage(out msg, IntPtr.Zero, 0, 0, PM_REMOVE))
-                        {
-                            TranslateMessage(ref msg);
-                            DispatchMessage(ref msg);
-                        }
-                        Thread.Sleep(1);
-                    }
-                    UnhookWindowsHookEx(hook);
-                }
-                Thread.Sleep(10);
-            }
-        });
-        thread.IsBackground = true;
-        thread.Start();
+        // 提升进程优先级，保证钩子回调及时响应
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+
+        _hookID = SetHook(_proc);
+        Application.Run(); // 消息循环，保持钩子有效
+        UnhookWindowsHookEx(_hookID);
     }
 
-    public static void Stop()
+    private static IntPtr SetHook(LowLevelKeyboardProc proc)
     {
-        Running = false;
+        using (Process curProcess = Process.GetCurrentProcess())
+        using (ProcessModule curModule = curProcess.MainModule)
+        {
+            return SetWindowsHookEx(WH_KEYBOARD_LL, proc,
+                GetModuleHandle(curModule.ModuleName), 0);
+        }
+    }
+
+    // 异步锁屏，避免钩子回调超时（300ms 预算）
+    private static void FireLock()
+    {
+        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { LockWorkStation(); } catch { }
+        });
+    }
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+        {
+            int vkCode = Marshal.ReadInt32(lParam);
+
+            // ---- 1) Ctrl + Shift + C -> 锁屏，独占 ----
+            if (vkCode == VK_C)
+            {
+                bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
+                if (ctrl && shift)
+                {
+                    if (DateTime.Now - _lastFireCtrlC > Debounce)
+                    {
+                        _lastFireCtrlC = DateTime.Now;
+                        FireLock();
+                    }
+                    // 独占：吞掉 C 键，不再向下传递
+                    return (IntPtr)1;
+                }
+            }
+
+            // ---- 2) Scroll Lock -> 锁屏，非独占 ----
+            if (vkCode == VK_SCROLL)
+            {
+                if (DateTime.Now - _lastFireScroll > Debounce)
+                {
+                    _lastFireScroll = DateTime.Now;
+                    FireLock();
+                }
+                // 不吞键：继续向下传递
+            }
+        }
+
+        return CallNextHookEx(_hookID, nCode, wParam, lParam);
     }
 }
-"@
+"@ -ReferencedAssemblies System.Windows.Forms
 
-Add-Type -TypeDefinition $code -Language CSharp
-[HookLooper]::Start()
-
-Write-Host "[+] 循环挂钩已启动。" -ForegroundColor Green
-Write-Host ""
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  解锁已激活" -ForegroundColor Green
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "[*] 保持此窗口运行，按键将不再被极域拦截。" -ForegroundColor White
-Write-Host "[*] 按 Ctrl+C 停止解锁。" -ForegroundColor White
-Write-Host ""
-
-# 定时打印挂钩状态
-$counter = 0
-while ($true) {
-    Start-Sleep -Seconds 10
-    $counter++
-    $hookCount = [HookLooper]::HookCount
-    Write-Host "[状态] 已运行 $($counter * 10) 秒，累计安装钩子 $hookCount 次。" -ForegroundColor DarkGray
-}
+Write-Host "[*] 已启动全局热键监听："
+Write-Host "    Ctrl+Shift+C  -> 锁屏 (独占)"
+Write-Host "    Scroll Lock   -> 锁屏 (非独占)"
+Write-Host "    按 Ctrl+C 退出"
+[MultiLockHotkey]::Start()
