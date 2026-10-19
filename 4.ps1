@@ -1,66 +1,45 @@
-# Windows 10：清除远程桌面连接历史及已保存凭据
-# 仅清理当前 Windows 用户的记录
 
+@'
 $ErrorActionPreference = "SilentlyContinue"
 
-Write-Host ""
-Write-Host "======================================" -ForegroundColor Cyan
-Write-Host "   Windows 远程桌面记录清理工具"
-Write-Host "======================================" -ForegroundColor Cyan
-Write-Host ""
+Write-Host "Cleaning Remote Desktop history..."
 
-# 1. 清除远程桌面连接历史记录
 $rdpPath = "HKCU:\Software\Microsoft\Terminal Server Client"
 
-# 删除已记录的远程服务器 IP 和主机名
+# Remove saved server addresses
 $serversPath = Join-Path $rdpPath "Servers"
 if (Test-Path $serversPath) {
     Remove-Item $serversPath -Recurse -Force
-    Write-Host "[完成] 已清除远程服务器地址历史" -ForegroundColor Green
 }
 
-# 清除远程桌面最近连接列表（MRU）
+# Remove recent connection entries
 $defaultPath = Join-Path $rdpPath "Default"
 if (Test-Path $defaultPath) {
-    $properties = Get-ItemProperty -Path $defaultPath
-    $properties.PSObject.Properties |
+    $item = Get-ItemProperty -Path $defaultPath
+    $item.PSObject.Properties |
         Where-Object { $_.Name -match '^MRU\d+$' } |
         ForEach-Object {
-            Remove-ItemProperty -Path $defaultPath `
-                -Name $_.Name -Force
+            Remove-ItemProperty -Path $defaultPath -Name $_.Name -Force
         }
-    Write-Host "[完成] 已清除最近连接列表" -ForegroundColor Green
 }
 
-# 2. 清除远程桌面默认用户名提示
-if (Test-Path $rdpPath) {
-    Remove-ItemProperty -Path $rdpPath `
-        -Name "UsernameHint" -Force
-}
+# Remove default username hint
+Remove-ItemProperty -Path $rdpPath -Name "UsernameHint" -Force
 
-# 3. 删除当前用户保存的远程桌面凭据
-# 只处理目标名称中包含 TERMSRV/ 的凭据
-$credentialOutput = & cmdkey.exe /list 2>&1
+# Remove saved RDP credentials
+$output = & cmdkey.exe /list 2>&1
 $targets = @()
 
-foreach ($line in $credentialOutput) {
+foreach ($line in $output) {
     if ($line -match '(?i)TERMSRV/([^\s]+)') {
-        $target = "TERMSRV/" + $Matches[1].Trim()
-        $targets += $target
+        $targets += "TERMSRV/$($Matches[1])"
     }
 }
 
-$targets = $targets | Sort-Object -Unique
-
-foreach ($target in $targets) {
-    & cmdkey.exe "/delete:$target" 2>&1 | Out-Null
-    Write-Host "[处理] $target" -ForegroundColor Yellow
+$targets | Sort-Object -Unique | ForEach-Object {
+    & cmdkey.exe "/delete:$_" 2>&1 | Out-Null
 }
 
-Write-Host ""
-Write-Host "======================================" -ForegroundColor Cyan
-Write-Host "清理操作已执行！" -ForegroundColor Green
-Write-Host "建议重新打开远程桌面验证。" -ForegroundColor Cyan
-Write-Host "======================================" -ForegroundColor Cyan
-Write-Host ""
-Read-Host "按回车键退出"
+Write-Host "Remote Desktop history cleanup completed."
+Read-Host "Press Enter to exit"
+'@ | Set-Content -LiteralPath "$env:USERPROFILE\Desktop\4.ps1" -Encoding UTF8
